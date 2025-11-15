@@ -4,100 +4,60 @@ export interface Env {
 }
 
 interface Message {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
-  timestamp: number;
 }
 
 export class CampingSession implements DurableObject {
   private state: DurableObjectState;
-  private messages: Message[];
+  private env: Env;
+  private chatHistory: Message[];
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
-    this.messages = [];
+    this.env = env;
+    this.chatHistory = [];
   }
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.pathname === '/chat' && request.method === 'POST') {
-      return this.handleChat(request);
+    if (request.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 });
     }
 
-    if (url.pathname === '/history' && request.method === 'GET') {
-      return this.getHistory();
-    }
-
-    if (url.pathname === '/clear' && request.method === 'POST') {
-      return this.clearHistory();
-    }
-
-    return new Response('Not Found', { status: 404 });
-  }
-
-  async initialize() {
-    const stored = await this.state.storage.get<Message[]>('messages');
+    const stored = await this.state.storage.get<Message[]>('chatHistory');
     if (stored) {
-      this.messages = stored;
+      this.chatHistory = stored;
+    } else {
+      this.chatHistory = [{
+        role: 'system',
+        content: 'You are a helpful camping assistant with expertise in outdoor activities, camping gear, campsite selection, and outdoor safety. Provide practical, friendly advice to help users plan their camping trips. Keep responses concise and actionable.'
+      }];
     }
-  }
-
-  async handleChat(request: Request): Promise<Response> {
-    await this.initialize();
 
     const body = await request.json() as { message: string };
-    const userMessage: Message = {
-      role: 'user',
-      content: body.message,
-      timestamp: Date.now()
-    };
-
-    this.messages.push(userMessage);
-
-    const env = (this.state as any).env as Env;
     
-    const systemPrompt = `You are a helpful camping assistant with expertise in outdoor activities, camping gear, campsite selection, and outdoor safety. Provide practical, friendly advice to help users plan their camping trips. Keep responses concise and actionable.`;
+    this.chatHistory.push({
+      role: 'user',
+      content: body.message
+    });
 
-    const conversationMessages = [
-      { role: 'system', content: systemPrompt },
-      ...this.messages.map(m => ({ role: m.role, content: m.content }))
-    ];
+    const contextMessages = this.chatHistory.slice(-5);
 
-    const aiResponse = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
-      messages: conversationMessages
+    const aiResponse = await this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+      messages: contextMessages
     });
 
     const assistantMessage: Message = {
       role: 'assistant',
-      content: (aiResponse as any).response,
-      timestamp: Date.now()
+      content: (aiResponse as any).response
     };
 
-    this.messages.push(assistantMessage);
-    await this.state.storage.put('messages', this.messages);
+    this.chatHistory.push(assistantMessage);
+    await this.state.storage.put('chatHistory', this.chatHistory);
 
     return new Response(JSON.stringify({
-      message: assistantMessage.content,
-      timestamp: assistantMessage.timestamp
+      response: assistantMessage.content
     }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
-  async getHistory(): Promise<Response> {
-    await this.initialize();
-    return new Response(JSON.stringify({
-      messages: this.messages
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
-  async clearHistory(): Promise<Response> {
-    this.messages = [];
-    await this.state.storage.put('messages', this.messages);
-    return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' }
     });
   }
@@ -112,7 +72,7 @@ export default {
         headers: {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type'
+          'Access-Control-Allow-Headers': 'Content-Type, X-Session-ID'
         }
       });
     }
@@ -123,26 +83,24 @@ export default {
       });
     }
 
-    const sessionId = request.headers.get('X-Session-ID') || 'default';
-    const durableObjectId = env.CAMPING_SESSION.idFromName(sessionId);
-    const durableObject = env.CAMPING_SESSION.get(durableObjectId);
+    if (request.method === 'POST') {
+      const sessionId = request.headers.get('X-Session-ID') || 'default';
+      const durableObjectId = env.CAMPING_SESSION.idFromName(sessionId);
+      const durableObject = env.CAMPING_SESSION.get(durableObjectId);
 
-    const durableObjectRequest = new Request(request.url, {
-      method: request.method,
-      headers: request.headers,
-      body: request.body
-    });
+      const response = await durableObject.fetch(request);
+      
+      const newResponse = new Response(response.body, {
+        status: response.status,
+        headers: response.headers
+      });
 
-    const response = await durableObject.fetch(durableObjectRequest);
-    
-    const newResponse = new Response(response.body, {
-      status: response.status,
-      headers: response.headers
-    });
+      newResponse.headers.set('Access-Control-Allow-Origin', '*');
+      
+      return newResponse;
+    }
 
-    newResponse.headers.set('Access-Control-Allow-Origin', '*');
-    
-    return newResponse;
+    return new Response('Not Found', { status: 404 });
   }
 };
 
@@ -362,11 +320,6 @@ const html = `<!DOCTYPE html>
             />
             <button id="sendButton" onclick="sendMessage()">Send</button>
         </div>
-        
-        <div class="controls">
-            <span class="session-id">Session: <span id="sessionId"></span></span>
-            <button onclick="clearChat()">Clear Chat</button>
-        </div>
     </div>
 
     <script>
@@ -375,7 +328,6 @@ const html = `<!DOCTYPE html>
             sessionId = 'session_' + Math.random().toString(36).substring(2, 15);
             localStorage.setItem('campingSessionId', sessionId);
         }
-        document.getElementById('sessionId').textContent = sessionId;
 
         const chatContainer = document.getElementById('chatContainer');
         const messageInput = document.getElementById('messageInput');
@@ -400,7 +352,7 @@ const html = `<!DOCTYPE html>
             loading.classList.add('active');
 
             try {
-                const response = await fetch('/chat', {
+                const response = await fetch('/', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -410,7 +362,7 @@ const html = `<!DOCTYPE html>
                 });
 
                 const data = await response.json();
-                addMessage('assistant', data.message);
+                addMessage('assistant', data.response);
             } catch (error) {
                 addMessage('assistant', 'Sorry, I encountered an error. Please try again.');
             } finally {
@@ -433,52 +385,6 @@ const html = `<!DOCTYPE html>
             chatContainer.appendChild(messageDiv);
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
-
-        async function clearChat() {
-            if (!confirm('Are you sure you want to clear the chat history?')) return;
-
-            try {
-                await fetch('/clear', {
-                    method: 'POST',
-                    headers: {
-                        'X-Session-ID': sessionId
-                    }
-                });
-
-                chatContainer.innerHTML = \`
-                    <div class="message assistant">
-                        <div class="message-content">
-                            Hello! I'm your Camping Buddy AI assistant. I can help you with camping gear recommendations, campsite suggestions, outdoor activities, and safety tips. What would you like to know about your next camping adventure?
-                        </div>
-                    </div>
-                \`;
-            } catch (error) {
-                alert('Failed to clear chat history');
-            }
-        }
-
-        async function loadHistory() {
-            try {
-                const response = await fetch('/history', {
-                    headers: {
-                        'X-Session-ID': sessionId
-                    }
-                });
-
-                const data = await response.json();
-                
-                if (data.messages && data.messages.length > 0) {
-                    chatContainer.innerHTML = '';
-                    data.messages.forEach(msg => {
-                        addMessage(msg.role, msg.content);
-                    });
-                }
-            } catch (error) {
-                console.error('Failed to load history');
-            }
-        }
-
-        loadHistory();
     </script>
 </body>
 </html>`;
