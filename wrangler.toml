@@ -1,0 +1,14 @@
+name = "cf-ai-camping-buddy"
+main = "src/index.ts"
+compatibility_date = "2024-11-15"
+
+[ai]
+binding = "AI"
+
+[[durable_objects.bindings]]
+name = "CAMPING_SESSION"
+class_name = "CampingSession"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["CampingSession"]
